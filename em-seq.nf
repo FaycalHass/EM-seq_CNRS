@@ -1,15 +1,18 @@
 // this consumes fastq files, adapter trims, then aligns reads to the specified reference using bwa-meth
 // mode can be set to tile_fastqs or run_fastqs depending on whether the system should map each tile's reads in distinct jobs then combine (tile_fastqs)
 // or all reads for a library in a single job (run_fastqs)
+nextflow.enable.dsl=1
 
 flowcell = params.flowcell
 genome = params.genome
 params.tmp_dir = '/tmp'
-outputPath = params.outdir = 'output'
+outputPath = params.outdir //='output
 fastq_mode = params.fastq_mode = 'run_fastqs'
 println "Processing " + flowcell + "... => " + outputPath
 
-fastq_glob = params.fastq_glob ?: '*.{1,2}.fastq*'
+fastq_glob = params.fastq_glob ?: '*.{1,2}*.fastq*'
+
+println fastq_glob
 Channel.fromFilePairs(fastq_glob)
     .map{ lib, read -> [flowcell: flowcell, 
                        library:lib,
@@ -19,42 +22,64 @@ Channel.fromFilePairs(fastq_glob)
                        lane:'all', 
                        tile:'all' ]
     }.set{fq_set_channel}
-    
+
 process mapping {
     cpus fastq_mode == 'tile-fastq' ? 4 : 16
-    errorStrategy 'retry'
-    tag { [flowcell, fq_set.library] }
+    // errorStrategy 'retry'
+    tag { [flowcell, lib] }
     conda "bioconda::bwameth=0.2.2 bioconda::seqtk=1.3 bioconda::sambamba=0.7.0 bioconda::fastp=0.20.1 bioconda::mark-nonconverted-reads=1.1"
 
     input:
-        val fq_set from fq_set_channel
+        // val fq_set from fq_set_channel
+        set val(fcell), val(lib), file(read1), file(read2), val(barcode), val(lane), val(tile) from fq_set_channel
 
     output:
-        set val(fq_set.library), file("*.aln.bam") into aligned_files
-        set val(fq_set.library), file("*.nonconverted.tsv") into nonconverted_counts
-        set val(fq_set.library), file("*_fastp.json") into fastp_log_files
+        set val(lib), file("*.aln.bam") into aligned_files
+        set val(lib), file("*.nonconverted.tsv") into nonconverted_counts
+        set val(lib), file("*_fastp.json") into fastp_log_files
 
     shell:
     '''
-    inst_name=$(zcat -f '!{fq_set.insert_read1}' | head -n 1 | cut -f 1 -d ':' | sed 's/^@//')
-    fastq_barcode=$(zcat -f '!{fq_set.insert_read1}' | head -n 1 | sed -r 's/.*://')
+    inst_name=$(zcat -f '!{read1}' | head -n 1 | cut -f 1 -d ':' | sed 's/^@//')
+    fastq_barcode=$(zcat -f '!{read1}' | head -n 1 | sed -r 's/.*://')
 
     if [[ "${inst_name:0:2}" == 'A0' || "${inst_name:0:2}" == 'NS' || \
-       [[ "${inst_name:0:2}" == 'NB' || "${inst_name:0:2}" == 'VH' || "${inst_name: -2:2}" == 'NX' ]] ; then
+          "${inst_name:0:2}" == 'NB' || "${inst_name:0:2}" == 'VH' || \
+          "${inst_name: -2:2}" == 'NX' ]] ; then
        trim_polyg='--trim_poly_g'
        echo '2-color instrument: poly-g trim mode on'
     else
        trim_polyg=''
     fi
-    seqtk mergepe <(zcat -f "!{fq_set.insert_read1}") <(zcat -f "!{fq_set.insert_read2}") \
-    | fastp --stdin --stdout -l 2 -Q ${trim_polyg} --interleaved_in --overrepresentation_analysis \
-            -j "!{fq_set.library}_fastp.json" 2> fastp.stderr \
-    | bwameth.py -p -t !{task.cpus} --read-group "@RG\\tID:${fastq_barcode}\\tSM:!{fq_set.library}" --reference !{genome} /dev/stdin \
-                 2>  "!{fq_set.library}_${fastq_barcode}!{fq_set.flowcell}_!{fq_set.lane}_!{fq_set.tile}.log.bwamem" \
-    | mark-nonconverted-reads.py 2> "!{fq_set.library}_${fastq_barcode}_!{fq_set.flowcell}_!{fq_set.lane}_!{fq_set.tile}.nonconverted.tsv" \
-    | sambamba view -t 2 -S -f bam -o "!{fq_set.library}_${fastq_barcode}_!{fq_set.flowcell}_!{fq_set.lane}_!{fq_set.tile}.aln.bam" /dev/stdin 2> sambamba.stderr;
-    '''
 
+    seqtk mergepe <(zcat -f "!{read1}") <(zcat -f "!{read2}") > "!{lib}_${fastq_barcode}!{fcell}_!{lane}_!{tile}.fastq"
+
+    fastp -l 2 \
+        -Q ${trim_polyg} \
+        --interleaved_in \
+        --overrepresentation_analysis \
+        -i "!{lib}_${fastq_barcode}!{fcell}_!{lane}_!{tile}.fastq" \
+        -j "!{lib}_fastp.json" \
+        -o "!{lib}_${fastq_barcode}!{fcell}_!{lane}_!{tile}_R1_cleaned.fastq" \
+        --out2 "!{lib}_${fastq_barcode}!{fcell}_!{lane}_!{tile}_R2_cleaned.fastq"\
+        2> fastp.stderr
+
+    bwameth.py -p -t !{task.cpus} \
+        --read-group "@RG\\tID:${fastq_barcode}\\tSM:!{lib}" \
+        --reference !{genome} "!{lib}_${fastq_barcode}!{fcell}_!{lane}_!{tile}_R1_cleaned.fastq" "!{lib}_${fastq_barcode}!{fcell}_!{lane}_!{tile}_R2_cleaned.fastq" \
+        > "!{lib}_${fastq_barcode}_!{fcell}_!{lane}_!{tile}.aln_bwameth.sam" \
+        2> "!{lib}_${fastq_barcode}!{fcell}_!{lane}_!{tile}.log.bwamem"
+
+    mark-nonconverted-reads.py \
+        --bam "!{lib}_${fastq_barcode}_!{fcell}_!{lane}_!{tile}.aln_bwameth.sam" \
+        --out "!{lib}_${fastq_barcode}_!{fcell}_!{lane}_!{tile}.aln_markNon.sam" \
+        2> "!{lib}_${fastq_barcode}_!{fcell}_!{lane}_!{tile}.nonconverted.tsv"
+
+    sambamba view -t 2 -S -f bam \
+    -o "!{lib}_${fastq_barcode}_!{fcell}_!{lane}_!{tile}.aln.bam" \
+    "!{lib}_${fastq_barcode}_!{fcell}_!{lane}_!{tile}.aln_markNon.sam" \
+    2> sambamba.stderr
+    '''
 }
 
 process mergeAndMarkDuplicates {
@@ -91,21 +116,21 @@ process mergeAndMarkDuplicates {
                  }
                  
 
-    process methylDackel_mbias {
-        cpus 8
-        errorStrategy 'retry'
-        tag {library}
-        conda "bioconda::methyldackel=0.6.1 conda-forge::pigz=2.8"
+process methylDackel_mbias {
+    cpus 8
+    errorStrategy 'retry'
+    tag {library}
+    conda "bioconda::methyldackel=0.6.1 conda-forge::pigz=2.8"
 
-        input:
-            tuple library, file(md_file), file(md_bai) from md_files_for_mbias.groupTuple()
+    input:
+        tuple library, file(md_file), file(md_bai) from md_files_for_mbias.groupTuple()
 
-        output:
-            file('*.svg') into mbias_output_svg
-            file('*.tsv') into mbias_output_tsv
-            tuple library, file('*.tsv') into mbias_for_aggregate
+    output:
+        file('*.svg') into mbias_output_svg
+        file('*.tsv') into mbias_output_tsv
+        tuple library, file('*.tsv') into mbias_for_aggregate
 
-        shell:
+    shell:
         '''
         echo -e "chr\tcontext\tstrand\tRead\tPosition\tnMethylated\tnUnmethylated\tnMethylated(+dups)\tnUnmethylated(+dups)" > !{library}_combined_mbias.tsv
         chrs=(`samtools view -H !{md_file} | grep @SQ | cut -f 2 | sed 's/SN://'| grep -v _random | grep -v chrUn | sed 's/|/\\|/'`)
@@ -142,7 +167,7 @@ process mergeAndMarkDuplicates {
 
         '''
 
-    }
+}
 
     process methylDackel_extract {
         cpus 8
@@ -178,7 +203,7 @@ process mergeAndMarkDuplicates {
 
         shell:
         '''
-        sambamba view -t !task.cpus -l 0 -f bam !{md_file} chr1 chr2 chr3 chr4 chr5 chr6 \
+        sambamba view -t !{task.cpus} -l 0 -f bam !{md_file} chr1 chr2 chr3 chr4 chr5 chr6 \
                                                   chr7 chr8 chr9 chr10 chr11 chr12 \
                                                   chr13 chr14 chr15 chr16 chr17 chr18 \
                                                   chr19 chr20 chr21 chr22 chrX chrY \
@@ -365,7 +390,7 @@ process mergeAndMarkDuplicates {
 
     process goleft {
         cpus 1
-        conda 'bioconda::goleft=0.2.0'
+        conda "bioconda::goleft=0.2.0"
 
         input:
             tuple library, file(md_file), file(md_bai) from md_files_for_goleft.groupTuple()
@@ -383,7 +408,7 @@ process mergeAndMarkDuplicates {
     process multiqc {
         cpus 1
         publishDir "${outputPath}", mode: 'copy'
-        conda "bioconda::multiqc=1.7"
+        conda "bioconda::multiqc=1.14.0"
 
         input:
             file('*') from fastqc_results.flatten().toList()
@@ -486,3 +511,397 @@ process mergeAndMarkDuplicates {
         '''
     }
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Charger les bibliothèques nécessaires
+library(methylKit)
+library(ggplot2)
+
+# Fonction principale
+analyzeMethylation <- function(input_file, output_dir, sample_id = "Sample1", assembly = "hg38",
+                               treatment = 0, context = "CpG", lo.count = 10, hi.perc = 99.9) {
+  
+  # Créer le dossier de sortie si nécessaire
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  # Gestion d'erreur pour la lecture du fichier
+  cat("Lecture du fichier de méthylation...\n")
+  meth <- tryCatch({
+    methRead(input_file, sample.id = sample_id, assembly = assembly,
+             treatment = treatment, context = context)
+  }, error = function(e) {
+    stop(paste("Erreur lors de la lecture du fichier :", e$message))
+  })
+  
+  # Sauvegarde du graphique de statistiques brutes
+  cat("Génération du graphique de statistiques brutes...\n")
+  png(file.path(output_dir, paste0(sample_id, "_raw_methylation_stats.png")), width = 800, height = 600)
+  getMethylationStats(meth, plot = TRUE)
+  dev.off()
+  
+  # Sauvegarde de l'histogramme de couverture
+  cat("Génération de l'histogramme de couverture...\n")
+  png(file.path(output_dir, paste0(sample_id, "_coverage_histogram.png")), width = 800, height = 600)
+  hist(getData(meth)$coverage, breaks = 100, main = "Distribution de la couverture", xlab = "Couverture")
+  dev.off()
+  
+  # Résumé statistique
+  cat("Résumé statistique de la couverture :\n")
+  print(summary(getData(meth)$coverage))
+  
+  # Filtrage des données
+  cat("Filtrage des données par couverture...\n")
+  meth.filt <- filterByCoverage(meth, lo.count = lo.count, hi.perc = hi.perc)
+  
+  # Sauvegarde du graphique après filtrage
+  png(file.path(output_dir, paste0(sample_id, "_filtered_methylation_stats.png")), width = 800, height = 600)
+  getMethylationStats(meth.filt, plot = TRUE, both.strands = FALSE)
+  dev.off()
+  
+  # Extraire les données
+  meth.data <- getData(meth.filt)
+  
+  # Sauvegarde des résultats
+  cat("Sauvegarde des résultats...\n")
+  write.csv(meth.data, file = file.path(output_dir, paste0(sample_id, "_meth_data_filtered.csv")), row.names = FALSE)
+  saveRDS(meth.filt, file = file.path(output_dir, paste0(sample_id, "_meth_filtered.rds")))
+  
+  cat("Analyse terminée avec succès pour : ", sample_id, "\n")
+}
+
+# Exemple d'utilisation
+analyzeMethylation(
+  input_file = "/Isiprod1/project/SB_fhassani/EM-seq/GSM_kit/GSM2772524_NA12878_CpG_methylkit_original.txt.gz",
+  output_dir = "/Isiprod1/project/SB_fhassani/EM-seq/test_CpG/figure_GSM2772524_NA12878_CpG",
+  sample_id = "GSM2772524_NA12878_CpG",
+  treatment = 0,
+  assembly = "hg19",
+  context = "CpG"
+) 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ------------------------------------------------------------------------
+#  EM-seq Methylation Pipeline – tout-en-un (PNG version, options forcées)
+#  (c) 2025  –  Adapté pour : /Isiprod1/project/SB_fhassani/EM-seq
+# ------------------------------------------------------------------------
+#  ► Toutes les étapes optionnelles (annotation & enrichissement GO) sont
+#    désormais **forcées** – si les packages manquent, le script tentera
+#    de les installer via BiocManager.
+#  ► Tous les graphiques sont exportés en PNG (300 dpi).
+# ------------------------------------------------------------------------
+#  ► À lancer :
+#     Rscript  EM_seq_pipeline_full_png.R
+# ------------------------------------------------------------------------
+
+## ───────────────────────── 0. PARAMETERS ──────────────────────────────
+projDir   <- "/Isiprod1/project/SB_fhassani/EM-seq"   # racine projet
+assembly  <- "hg38"
+sample.id <- c("CTRL", "TRAITE")
+file.list <- c(
+  "output_test_SRR13953195/SRR13953195_CpG.methylKit.gz",
+  "GSM_kit/GSM2772524_NA12878_CpG_percent.txt.gz"
+)
+file.list <- as.list(file.path(projDir, file.list))
+
+treatment <- c(0, 1)
+
+# -------- NOUVEAU : dossier de sortie centralisé --------
+outDir <- "/Isiprod1/project/SB_fhassani/EM-seq/test_CpG/test_result_GSM"
+if (!dir.exists(outDir)) dir.create(outDir, recursive = TRUE)
+
+# Seuils de différenciation
+site.diff <- 25; site.qval <- 0.01
+win.diff  <- 10; win.qval <- 0.05
+
+cores <- max(1, parallel::detectCores() - 1)
+opt   <- options(mc.cores = cores)
+
+## ───────────────────────── 1. PACKAGES ────────────────────────────────
+message("[1] Loading packages …")
+suppressPackageStartupMessages({
+  library(methylKit); library(ggplot2); library(data.table)
+})
+
+# ---- Forcer l'installation des packages optionnels si absents --------
+optional_pkgs <- c("genomation", "GenomicFeatures", "clusterProfiler", "org.Hs.eg.db", "enrichplot")
+for (p in optional_pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) {
+    message(sprintf("[1] Installing missing package: %s", p))
+    if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+    BiocManager::install(p, ask = FALSE, update = FALSE)
+  }
+}
+# (Re)charger après installation
+suppressPackageStartupMessages({
+  lapply(optional_pkgs, function(pkg) {
+    suppressWarnings(require(pkg, character.only = TRUE))
+  })
+})
+
+## helper for high‑res PNG
+gsave_png <- function(plot, filename, width = 7, height = 7, dpi = 300) {
+  ggsave(filename = filename, plot = plot, width = width, height = height,
+         dpi = dpi, units = "in")
+}
+
+## ───────────────────────── 2. INPUT QC ────────────────────────────────
+message("[2] Reading methylation calls …")
+stopifnot(length(file.list) == length(sample.id),
+          length(sample.id) == length(treatment))
+
+myobj <- methRead(location = file.list,
+                  sample.id = as.list(sample.id),
+                  assembly  = assembly,
+                  treatment = treatment,
+                  context   = "CpG")
+
+# Couverture avant filtre — un PNG par échantillon
+for (i in seq_along(myobj)) {
+  png(file.path(outDir, sprintf("QC_coverage_before_filter_%s.png", sample.id[i])),
+      width = 7, height = 7, units = "in", res = 300)
+  getCoverageStats(myobj[[i]], plot = TRUE, both.strands = FALSE)
+  dev.off()
+}
+
+## ───────────────────── 3. FILTER & NORMALISE ──────────────────────────
+message("[3] Filtering & normalising …")
+myobj.filt <- filterByCoverage(myobj, lo.count = 10, hi.perc = 99.9)
+myobj.norm <- normalizeCoverage(myobj.filt)
+
+# Couverture après filtre
+for (i in seq_along(myobj.norm)) {
+  png(file.path(outDir, sprintf("QC_coverage_after_filter_%s.png", sample.id[i])),
+      width = 7, height = 7, units = "in", res = 300)
+  getCoverageStats(myobj.norm[[i]], plot = TRUE, both.strands = FALSE)
+  dev.off()
+}
+
+## ───────────────────── 4. UNION & DIFFERENTIAL ────────────────────────
+message("[4] Unite CpG positions …")
+
+meth.united <- unite(myobj.norm, destrand = TRUE)
+
+diffMeth <- calculateDiffMeth(meth.united,
+                              test = "fast.fisher",
+                              overdispersion = "MN",
+                              mc.cores = cores)
+
+dmr.hyper <- getMethylDiff(diffMeth, difference = site.diff,
+                           qvalue = site.qval, type = "hyper")
+dmr.hypo  <- getMethylDiff(diffMeth, difference = site.diff,
+                           qvalue = site.qval, type = "hypo")
+
+## ───────────────────── 5. WINDOW (DMR) ANALYSIS ───────────────────────
+message("[5] Differential methylation (1 kb windows) …")
+tiles        <- tileMethylCounts(myobj.norm, win.size = 1000, step.size = 1000,
+                                 mc.cores = cores)
+tiles.united <- unite(tiles, destrand = TRUE)
+tiles.diff   <- calculateDiffMeth(tiles.united, test = "fast.fisher",
+                                  mc.cores = cores)
+tiles.sig    <- getMethylDiff(tiles.diff, difference = win.diff,
+                              qvalue = win.qval)
+
+## ───────────────────── 6. SAVE RESULTS ────────────────────────────────
+message("[6] Writing outputs …")
+write.csv(dmr.hyper, file.path(outDir, "CpGs_hypermethylated.csv"), row.names = FALSE)
+write.csv(dmr.hypo , file.path(outDir, "CpGs_hypomethylated.csv"), row.names = FALSE)
+
+saveRDS(diffMeth ,  file.path(outDir, "diffMeth_perSite.rds"))
+saveRDS(tiles.diff, file.path(outDir, "diffMeth_tiles.rds"))
+
+if (nrow(dmr.hyper) > 0) {
+  bed <- data.table(chr = dmr.hyper$chr, start = dmr.hyper$start, end = dmr.hyper$end)
+  fwrite(bed[1:min(1000,.N)], file.path(outDir, "top_hyper_CpG.bed"),
+         sep = "\t", col.names = FALSE)
+}
+if (nrow(dmr.hypo) > 0) {
+  bed <- data.table(chr = dmr.hypo$chr, start = dmr.hypo$start, end = dmr.hypo$end)
+  fwrite(bed[1:min(1000,.N)], file.path(outDir, "top_hypo_CpG.bed"),
+         sep = "\t", col.names = FALSE)
+}
+
+## ───────────────────── 7. PLOTS INTERPRETATION ────────────────────────
+message("[7] Creating interpretation plots …")
+if (nrow(dmr.hyper) > 0) {
+  p.volcano <- ggplot(dmr.hyper, aes(meth.diff, -log10(qvalue))) +
+    geom_point(alpha = 0.4, size = 1) +
+    geom_vline(xintercept = c(site.diff, -site.diff), lty = 2) +
+    geom_hline(yintercept = -log10(site.qval), lty = 2) +
+    labs(title = "CpG hyperméthylés", x = "∆ méthylation (%)", y = "-log10(qvalue)") +
+    theme_minimal()
+  gsave_png(p.volcano, file.path(outDir, "plot_volcano_hyper.png"))
+}
+
+df.all <- as.data.frame(diffMeth)
+if (nrow(df.all) > 0) {
+  df.all$chr <- factor(df.all$chr, levels = paste0("chr", c(1:22, "X", "Y")))
+  df.all$pos <- (df.all$start + df.all$end)/2
+  p.manhattan <- ggplot(df.all, aes(pos/1e6, -log10(qvalue), colour = chr)) +
+    geom_point(alpha = 0.4, size = 0.3) +
+    facet_grid(. ~ chr, scales = "free_x", space = "free_x") +
+    theme_minimal(base_size = 8) +
+    theme(legend.position = "none") +
+    labs(x = "Position (Mb)", y = "-log10(qvalue)")
+  gsave_png(p.manhattan, file.path(outDir, "plot_manhattan.png"), width = 12, height = 4)
+}
+
+## ───────────────────── 8. ANNOTATION (FORCÉ) ──────────────────────────
+if (nrow(tiles.sig) > 0) {
+  message("[8] Annotating DMRs …")
+  suppressPackageStartupMessages({library(genomation); library(GenomicFeatures)})
+  txdb <- makeTxDbFromUCSC(genome = assembly, tablename = "refGene")
+  ann.tiles <- annotateWithGeneParts(as(tiles.sig, "GRanges"), getGeneParts(txdb))
+  write.table(as.data.frame(ann.tiles), file.path(outDir, "DMR_tiles_annotation.tsv"),
+              sep = "\t", quote = FALSE, row.names = FALSE)
+  png(file.path(outDir, "plot_annotation_bar.png"), width = 7, height = 7, units = "in", res = 300)
+  plotTargetAnnotation(ann.tiles, col = "cornflowerblue", border = NA)
+  dev.off()
+} else {
+  message("[8] No tiles for annotation – skipped.")
+}
+
+## ───────────────────── 9. ENRICHISSEMENT GO (FORCÉ) ───────────────────
+if (exists("ann.tiles") && length(ann.tiles) > 0) {
+  message("[9] GO enrichment …")
+  suppressPackageStartupMessages({library(clusterProfiler); library(org.Hs.eg.db); library(enrichplot)})
+  genes <- unique(ann.tiles$geneId[ann.tiles$feature == "promoter"])
+  if (length(genes) > 0) {
+    ego   <- enrichGO(gene = genes, OrgDb = org.Hs.eg.db, keyType = "ENTREZID", ont = "BP", pAdjustMethod = "BH", readable = TRUE)
+    p.go   <- dotplot(ego, showCategory = 20) + ggtitle("GO Biological Process (promoters DMR)")
+    gsave_png(p.go, file.path(outDir, "GO_BP_enrichment.png"), width = 8, height = 6)
+    saveRDS(ego, file.path(outDir, "GO_enrich.rds"))
+  } else {
+    message("⏩ GO enrichment ignoré (aucun gène/promoteur détecté).")
+  }
+} else {
+  message("⏩ GO enrichment ignoré (packages ou annotations manquants).")
+}
+
+## ───────────────────── 10. SESSION INFO ──────────────────────────────
+writeLines(capture.output(sessionInfo()), file.path(outDir, "sessionInfo.txt"))
+options(opt)
+message("
+✔ Pipeline terminé : tous les résultats sont dans → ", outDir)
